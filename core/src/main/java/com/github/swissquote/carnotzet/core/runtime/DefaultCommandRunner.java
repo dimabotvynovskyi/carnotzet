@@ -2,8 +2,10 @@ package com.github.swissquote.carnotzet.core.runtime;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.UncheckedIOException;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.SystemUtils;
 
 import com.github.swissquote.carnotzet.core.CarnotzetDefinitionException;
 import com.google.common.base.Joiner;
@@ -39,8 +41,9 @@ public final class DefaultCommandRunner implements CommandRunner {
 		if (inheritIo) {
 			pb.inheritIO();
 		} else {
-			pb.redirectError(new File("/dev/null"));
-			pb.redirectOutput(new File("/dev/null"));
+			File sink = getOsSpecificSink();
+			pb.redirectError(sink);
+			pb.redirectOutput(sink);
 		}
 		try {
 			Process p = pb.start();
@@ -57,31 +60,45 @@ public final class DefaultCommandRunner implements CommandRunner {
 		}
 	}
 
+	private File getOsSpecificSink() {
+		if (SystemUtils.IS_OS_WINDOWS) {
+			return new File("NUL");
+		}
+		return new File("/dev/null");
+	}
+
 	public String runCommandAndCaptureOutput(String... command) {
 		return runCommandAndCaptureOutput(new File("/"), command);
 	}
 
 	public String runCommandAndCaptureOutput(File directoryForRunning, String... command) {
-
+		log.debug("Running command [{}]", Joiner.on(" ").join(command));
 		ProcessBuilder pb = new ProcessBuilder(command);
 		pb.directory(directoryForRunning);
 		try {
+			// we use a temp file to avoid having to manage a thread to read the process output.
+			// reading the output while the process is running is mandatory in cases where
+			// it outputs more than 4k of data (OS buffer size for pipes). Otherwise the process will freeze.
+			// http://java-monitor.com/forum/showthread.php?t=4067
+			final File tmp = File.createTempFile("carnotzet-cmd-out", null);
+			tmp.deleteOnExit();
+			pb.redirectErrorStream(true).redirectOutput(tmp);
 			Process p = pb.start();
 			p.waitFor();
-			String stdOut = getInputAsString(p.getInputStream());
-			String stdErr = getInputAsString(p.getErrorStream());
-			return stdOut.trim() + stdErr.trim();
+
+			String output = FileUtils.readFileToString(tmp);
+			output = output.trim();
+
+			if (p.exitValue() != 0) {
+				throw new RuntimeException("External command [" + Joiner.on(" ").join(command) + "] exited with [" + p.exitValue()
+						+ "], output: " + output);
+			}
+			return output;
 		}
 		catch (InterruptedException | IOException e) {
 			throw new RuntimeException(e);
 		}
 
-	}
-
-	private static String getInputAsString(InputStream is) {
-		try (java.util.Scanner s = new java.util.Scanner(is, "UTF-8")) {
-			return s.useDelimiter("\\A").hasNext() ? s.next() : "";
-		}
 	}
 
 }

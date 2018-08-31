@@ -2,12 +2,14 @@ package com.github.swissquote.carnotzet.core.maven;
 
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -16,6 +18,7 @@ import org.apache.maven.shared.invoker.DefaultInvocationRequest;
 import org.apache.maven.shared.invoker.DefaultInvoker;
 import org.apache.maven.shared.invoker.InvocationOutputHandler;
 import org.apache.maven.shared.invoker.InvocationRequest;
+import org.apache.maven.shared.invoker.InvocationResult;
 import org.apache.maven.shared.invoker.Invoker;
 import org.apache.maven.shared.invoker.MavenInvocationException;
 
@@ -35,22 +38,27 @@ public class MavenDependencyResolver {
 	private final Path resourcesPath;
 
 	private final Invoker maven = new DefaultInvoker();
-
+	private final TopologicalSorter topologicalSorter = new TopologicalSorter();
+	private final ConcurrentHashMap<CarnotzetModuleCoordinates, Node> dependencyTreeCache = new ConcurrentHashMap<>();
 	private Path localRepoPath;
 
-	private final TopologicalSorter topologicalSorter = new TopologicalSorter();
-
-	public List<CarnotzetModule> resolve(CarnotzetModuleCoordinates topLevelModuleId) {
+	public List<CarnotzetModule> resolve(CarnotzetModuleCoordinates topLevelModuleId, Boolean failOnCycle) {
 		log.debug("Resolving module dependencies");
-		Path pomFile = getPomFile(topLevelModuleId);
-		Node tree = resolveDependencyTree(pomFile);
+		Node tree = getDependenciesTree(topLevelModuleId);
 		log.debug("Computing topological ordering of GAs in full dependency tree before resolution (maven2)");
-		List<Node> topology = topologicalSorter.sort(tree);
+		List<Node> topology = topologicalSorter.sort(tree, failOnCycle);
 		topology = filterInterestingNodes(topology);
 		String topLevelModuleName = moduleNameProvider.apply(topLevelModuleId);
 		List<CarnotzetModule> result = convertNodesToModules(topology, topLevelModuleName);
 		ensureJarFilesAreDownloaded(result, topLevelModuleId);
 		return result;
+	}
+
+	public Node getDependenciesTree(CarnotzetModuleCoordinates topLevelModuleId) {
+		return dependencyTreeCache.computeIfAbsent(topLevelModuleId, moduleId -> {
+			Path pomFile = getPomFile(moduleId);
+			return resolveDependencyTree(pomFile);
+		});
 	}
 
 	private List<Node> filterInterestingNodes(List<Node> topology) {
@@ -71,7 +79,12 @@ public class MavenDependencyResolver {
 	}
 
 	private void downloadJars(CarnotzetModuleCoordinates topLevelModuleId) {
-		String gav = topLevelModuleId.getGroupId() + ":" + topLevelModuleId.getArtifactId() + ":" + topLevelModuleId.getVersion();
+		// format : groupId:artifactId:version[:packaging[:classifier]]
+		String gav = topLevelModuleId.getGroupId() + ":" + topLevelModuleId.getArtifactId() + ":" + topLevelModuleId.getVersion() + ":jar";
+		if (topLevelModuleId.getClassifier() != null) {
+			gav += ":" + topLevelModuleId.getClassifier();
+		}
+
 		executeMavenBuild(Arrays.asList("org.apache.maven.plugins:maven-dependency-plugin:2.10:get -Dartifact=" + gav), null);
 	}
 
@@ -82,7 +95,8 @@ public class MavenDependencyResolver {
 			CarnotzetModuleCoordinates coord = new CarnotzetModuleCoordinates(
 					artifact.getGroupId(),
 					artifact.getArtifactId(),
-					artifact.getVersion());
+					artifact.getVersion(),
+					artifact.getClassifier());
 			String name = moduleNameProvider.apply(coord);
 			if (name == null) {
 				continue;
@@ -106,7 +120,15 @@ public class MavenDependencyResolver {
 				.resolve(artifact.getGroupId().replace(".", "/"))
 				.resolve(artifact.getArtifactId())
 				.resolve(artifact.getVersion())
-				.resolve(artifact.getArtifactId() + "-" + artifact.getVersion() + ".jar");
+				.resolve(getJarName(artifact));
+	}
+
+	private String getJarName(CarnotzetModuleCoordinates artifact) {
+		String jarName = artifact.getArtifactId() + "-" + artifact.getVersion();
+		if (artifact.getClassifier() != null) {
+			jarName += "-" + artifact.getClassifier();
+		}
+		return jarName + ".jar";
 	}
 
 	private Path getPomFile(CarnotzetModuleCoordinates artifact) {
@@ -136,13 +158,19 @@ public class MavenDependencyResolver {
 		InvocationRequest request = new DefaultInvocationRequest();
 		request.setBatchMode(true);
 		request.setGoals(goals);
+		// reset MAVEN_DEBUG_OPTS to allow debugging without blocking the invoker calls
+		request.addShellEnvironment("MAVEN_DEBUG_OPTS", "");
 		InvocationOutputHandler outHandler = outputHandler;
 		if (outHandler == null) {
 			outHandler = log::debug;
 		}
 		request.setOutputHandler(outHandler);
 		try {
-			maven.execute(request);
+			InvocationResult result = maven.execute(request);
+			if (result.getExitCode() != 0) {
+				throw new MavenInvocationException("Maven process exited with non-zero code [" + result.getExitCode() + "]. "
+						+ "Retry with debug log level enabled to see the maven invocation logs");
+			}
 		}
 		catch (MavenInvocationException e) {
 			throw new CarnotzetDefinitionException("Error invoking mvn " + goals, e);
@@ -160,8 +188,8 @@ public class MavenDependencyResolver {
 				+ " -DoutputType=text "
 				+ " -DoutputFile=" + treePath.toAbsolutePath().toString();
 		executeMavenBuild(Arrays.asList(command), null);
-		try {
-			return new TreeTextParser().parse(new InputStreamReader(Files.newInputStream(treePath), "UTF-8"));
+		try (Reader r = new InputStreamReader(Files.newInputStream(treePath), "UTF-8")) {
+			return new TreeTextParser().parse(r);
 		}
 		catch (ParseException | IOException e) {
 			throw new RuntimeException(e);
@@ -234,3 +262,4 @@ public class MavenDependencyResolver {
 	}
 
 }
+

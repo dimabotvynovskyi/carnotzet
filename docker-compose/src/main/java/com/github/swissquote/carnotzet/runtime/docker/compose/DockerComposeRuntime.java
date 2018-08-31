@@ -1,6 +1,10 @@
 package com.github.swissquote.carnotzet.runtime.docker.compose;
 
+import static java.util.stream.Collectors.toList;
+
+import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -14,22 +18,34 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.SystemUtils;
 
 import com.github.swissquote.carnotzet.core.Carnotzet;
 import com.github.swissquote.carnotzet.core.CarnotzetModule;
+import com.github.swissquote.carnotzet.core.docker.DockerUtils;
+import com.github.swissquote.carnotzet.core.docker.registry.DockerRegistry;
 import com.github.swissquote.carnotzet.core.runtime.CommandRunner;
 import com.github.swissquote.carnotzet.core.runtime.DefaultCommandRunner;
 import com.github.swissquote.carnotzet.core.runtime.api.Container;
 import com.github.swissquote.carnotzet.core.runtime.api.ContainerOrchestrationRuntime;
+import com.github.swissquote.carnotzet.core.runtime.api.PullPolicy;
 import com.github.swissquote.carnotzet.core.runtime.log.LogListener;
 import com.google.common.base.Strings;
 import com.google.common.io.Files;
 
+import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
+
+	private static final Pattern IP_ADDRESS_PATTERN = Pattern.compile(
+			"^(([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\.){3}([01]?\\d\\d?|2[0-4]\\d|25[0-5])$");
 
 	private final Carnotzet carnotzet;
 
@@ -39,11 +55,19 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 
 	private final CommandRunner commandRunner;
 
+	private final Boolean shouldExposePorts;
+
 	public DockerComposeRuntime(Carnotzet carnotzet) {
 		this(carnotzet, carnotzet.getTopLevelModuleName());
 	}
 
 	public DockerComposeRuntime(Carnotzet carnotzet, String instanceId, CommandRunner commandRunner) {
+		// Due to limitations in docker for mac and windows, mapping local ports to container ports is the preferred technique for those users.
+		// https://docs.docker.com/docker-for-mac/networking/#i-cannot-ping-my-containers
+		this(carnotzet, instanceId, commandRunner, SystemUtils.IS_OS_MAC || SystemUtils.IS_OS_WINDOWS);
+	}
+
+	public DockerComposeRuntime(Carnotzet carnotzet, String instanceId, CommandRunner commandRunner, Boolean shouldExposePorts) {
 		this.carnotzet = carnotzet;
 		if (instanceId != null) {
 			this.instanceId = instanceId;
@@ -52,6 +76,7 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 		}
 		this.logManager = new DockerLogManager();
 		this.commandRunner = commandRunner;
+		this.shouldExposePorts = shouldExposePorts;
 	}
 
 	public DockerComposeRuntime(Carnotzet carnotzet, String instanceId) {
@@ -69,25 +94,29 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 				continue;
 			}
 			Service.ServiceBuilder serviceBuilder = Service.builder();
-			String moduleName = module.getName();
+			String serviceId = module.getServiceId();
 
 			serviceBuilder.image(module.getImageName());
 			serviceBuilder.volumes(module.getDockerVolumes());
-			serviceBuilder.entrypoint(module.getDockerEntrypoint());
-			serviceBuilder.command(module.getDockerCmd());
+			serviceBuilder.entrypoint(DockerUtils.parseEntrypointOrCmd(module.getDockerEntrypoint()));
+			serviceBuilder.command(DockerUtils.parseEntrypointOrCmd(module.getDockerCmd()));
+			serviceBuilder.environment(module.getEnv());
 			serviceBuilder.env_file(module.getDockerEnvFiles());
+			if (shouldExposePorts) {
+				serviceBuilder.ports(getExposedPorts(module.getImageName(), module.getProperties()));
+			}
 
 			Map<String, ContainerNetwork> networks = new HashMap<>();
 			Set<String> networkAliases = new HashSet<>();
 			networkAliases.addAll(lookUpCustomAliases(module));
 
 			// Carnotzet semantics name
-			networkAliases.add(module.getName() + ".docker");
-			networkAliases.add(instanceId + "." + module.getName() + ".docker");
+			networkAliases.add(module.getServiceId() + ".docker");
+			networkAliases.add(instanceId + "." + module.getServiceId() + ".docker");
 
 			// Legacy compat (default dnsdock pattern)
 			networkAliases.add(module.getShortImageName() + ".docker");
-			networkAliases.add(instanceId + "_" + module.getName() + "." + module.getShortImageName() + ".docker");
+			networkAliases.add(instanceId + "_" + module.getServiceId() + "." + module.getShortImageName() + ".docker");
 
 			ContainerNetwork network = ContainerNetwork.builder().aliases(networkAliases).build();
 			networks.put("carnotzet", network);
@@ -97,15 +126,16 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 			if (module.getLabels() != null) {
 				labels.putAll(module.getLabels());
 			}
-			labels.put("com.dnsdock.alias", instanceId + "." + module.getName() + ".docker");
+			labels.put("com.dnsdock.alias", networkAliases.stream().collect(Collectors.joining(",")));
 			labels.put("carnotzet.instance.id", instanceId);
 			labels.put("carnotzet.module.name", module.getName());
+			labels.put("carnotzet.module.service.id", module.getServiceId());
 			labels.put("carnotzet.top.level.module.name", carnotzet.getTopLevelModuleName());
 
 			serviceBuilder.labels(labels);
 			serviceBuilder.extra_hosts(lookUpExtraHosts(module));
 
-			services.put(moduleName, serviceBuilder.build());
+			services.put(serviceId, serviceBuilder.build());
 		}
 
 		Network network = Network.builder().driver("bridge").build();
@@ -136,7 +166,7 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 	private List<String> parseNetworkAliases(String s) {
 		return Arrays.stream(s.split(","))
 				.map(String::trim)
-				.collect(Collectors.toList());
+				.collect(toList());
 	}
 
 	private Set<String> lookUpExtraHosts(CarnotzetModule m) {
@@ -144,7 +174,7 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 		if (m.getProperties() != null && m.getProperties().containsKey("extra.hosts")) {
 			result.addAll(Arrays.stream(m.getProperties().get("extra.hosts").split(","))
 					.map(String::trim)
-					.collect(Collectors.toList()));
+					.collect(toList()));
 		}
 		return result;
 	}
@@ -154,9 +184,28 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 		log.debug("Forcing update of docker-compose.yml before start");
 		computeDockerComposeFile();
 		Instant start = Instant.now();
-		runCommand("docker-compose", "-p", getDockerComposeProjectName(), "up", "-d");
+		carnotzet.getModules().stream().filter(this::shouldStartByDefault).forEach(m ->
+				runCommand("docker-compose", "-p", getDockerComposeProjectName(), "up", "-d", m.getServiceId())
+		);
 		ensureNetworkCommunicationIsPossible();
 		logManager.ensureCapturingLogs(start, getContainers());
+	}
+
+	private boolean shouldStartByDefault(CarnotzetModule m) {
+		if (m.getImageName() == null) {
+			return false;
+		}
+		if (m.getProperties() == null) {
+			return true;
+		}
+		String str = m.getProperties().get("start.by.default");
+		if (str == null) {
+			return true;
+		}
+		if (str.trim().toLowerCase().equals("false")) {
+			return false;
+		}
+		return true;
 	}
 
 	@Override
@@ -170,8 +219,13 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 	}
 
 	private void ensureNetworkCommunicationIsPossible() {
+
+		if (!SystemUtils.IS_OS_LINUX) {
+			return;
+		}
+
 		String buildContainerId =
-				runCommandAndCaptureOutput("/bin/sh", "-c", "docker ps | grep $(hostname) | grep -v k8s_POD | cut -d ' ' -f 1");
+				runCommandAndCaptureOutput("/bin/bash", "-c", "docker ps | grep $(hostname) | grep -v k8s_POD | cut -d ' ' -f 1");
 
 		if (Strings.isNullOrEmpty(buildContainerId)) {
 			// we are probably not running inside a container, networking should be fine
@@ -181,7 +235,7 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 		log.debug("Execution from inside a container detected! Attempting to configure container networking to allow communication.");
 
 		String networkMode =
-				runCommandAndCaptureOutput("/bin/sh", "-c", "docker inspect -f '{{.HostConfig.NetworkMode}}' " + buildContainerId);
+				runCommandAndCaptureOutput("/bin/bash", "-c", "docker inspect -f '{{.HostConfig.NetworkMode}}' " + buildContainerId);
 
 		String containerToConnect = buildContainerId;
 
@@ -189,9 +243,44 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 		if (networkMode.startsWith("container:")) {
 			containerToConnect = networkMode.replace("container:", "");
 			log.debug("Detected a shared container network stack.");
+
+			String parentNetworkMode =
+					runCommandAndCaptureOutput("/bin/bash", "-c", "docker inspect -f '{{.HostConfig.NetworkMode}}' " + containerToConnect);
+
+			if ("none".equals(parentNetworkMode)) {
+				// Parent network is most likely managed by a CNI plugin.
+				// For DNS to work, it needs to be exposed by a service named carnotzet-dns.
+				Container dnsContainer = getContainer("carnotzet-dns");
+				if (dnsContainer == null) {
+					log.warn("Infrastructure container has NetworkMode [none] and there is no [carnotzet-dns] service in the environment, "
+							+ "name resolution of [*.docker] will not work from this container");
+					return;
+				}
+				String dnsIp = dnsContainer.getIp();
+				if (dnsIp == null || !IP_ADDRESS_PATTERN.matcher(dnsIp).matches()) {
+					log.warn("Infrastructure container has NetworkMode [none] and could not get IP of [carnotzet-dns] service, "
+							+ "name resolution of [*.docker] will not work from this container");
+					return;
+				}
+				log.debug("Adding nameserver [{}] to the container's /etc/resolv.conf", dnsContainer.getIp());
+				try {
+					RandomAccessFile f = new RandomAccessFile(new File("/etc/resolv.conf"), "rw");
+					f.seek(0); // to the beginning
+					f.write(("nameserver " + dnsIp).getBytes(StandardCharsets.US_ASCII));
+					f.close();
+				}
+				catch (IOException e) {
+					log.warn("Failed to add nameserver to /etc/resolv.conf, name resolution of [*.docker] will not work from this container", e);
+				}
+
+				return;
+			}
+
 		}
+
 		log.debug("attaching container [" + containerToConnect + "] to network [" + getDockerNetworkName() + "]");
-		runCommand("/bin/sh", "-c", "docker network connect " + getDockerNetworkName() + " " + containerToConnect);
+		runCommand("/bin/bash", "-c", "docker network connect " + getDockerNetworkName() + " " + containerToConnect);
+
 	}
 
 	private String getDockerComposeProjectName() {
@@ -211,9 +300,6 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 	public void stop() {
 		ensureDockerComposeFileIsPresent();
 		runCommand("docker-compose", "-p", getDockerComposeProjectName(), "stop");
-		// networks are created on demand and it's very fast, deleting the network upon stop helps avoiding sub-network starvation
-		// when using a lot of docker networks
-		runCommandAndCaptureOutput("docker", "network", "rm", getDockerNetworkName());
 	}
 
 	@Override
@@ -232,6 +318,16 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 	public void clean() {
 		ensureDockerComposeFileIsPresent();
 		runCommand("docker-compose", "-p", getDockerComposeProjectName(), "rm", "-f");
+		// The resources folder cannot be deleted while the sandbox is running on windows.
+		// So we do it here instead
+		if (SystemUtils.IS_OS_WINDOWS) {
+			try {
+				FileUtils.deleteDirectory(carnotzet.getResourcesFolder().toFile());
+			}
+			catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		}
 	}
 
 	@Override
@@ -250,30 +346,48 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 	}
 
 	@Override
-	public void pull(String service) {
-		ensureDockerComposeFileIsPresent();
-		runCommand("docker-compose", "-p", getDockerComposeProjectName(), "pull", service);
+	public void pull() {
+		pull(PullPolicy.ALWAYS);
 	}
 
 	@Override
-	public void pull() {
-		ensureDockerComposeFileIsPresent();
-		runCommand("docker-compose", "-p", getDockerComposeProjectName(), "pull");
+	public void pull(PullPolicy policy) {
+		// We need to check service by service if a newer version exists or not
+		carnotzet.getModules().forEach(module -> pull(module.getServiceId(), policy));
+	}
+
+	@Override
+	public void pull(@NonNull String service) {
+		pull(service, PullPolicy.ALWAYS);
+	}
+
+	@Override
+	public void pull(@NonNull String service, PullPolicy policy) {
+		// Find out the name and tag of the image we are trying to pull
+		CarnotzetModule serviceModule = carnotzet.getModuleByServiceId(service)
+				.orElseThrow(() -> new IllegalArgumentException("No such service: " + service));
+
+		DockerRegistry.pullImage(serviceModule, policy);
 	}
 
 	@Override
 	public List<Container> getContainers() {
 		String commandOutput = runCommandAndCaptureOutput("docker-compose", "-p", getDockerComposeProjectName(),
-				"ps", "-q").replaceAll("\n", " ");
+				"ps", "-q").replaceAll(System.lineSeparator(), " ");
 		log.debug("docker-compose ps output : " + commandOutput);
 		if (commandOutput.trim().isEmpty()) {
 			return Collections.emptyList();
 		}
-		List<String> args = new ArrayList<>(Arrays.asList("docker", "inspect", "-f", "{{ index .Id}}:"
-				+ "{{ index .Config.Labels \"com.docker.compose.service\" }}:"
-				+ "{{ index .State.Running}}:"
-				+ "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}:"
-		));
+		StringBuilder template = new StringBuilder("{{ index .Id}}:");
+		if (SystemUtils.IS_OS_WINDOWS) {
+			template.append("{{ index .Config.Labels \\\"com.docker.compose.service\\\" }}:");
+		} else {
+			template.append("{{ index .Config.Labels \"com.docker.compose.service\" }}:");
+		}
+		template.append("{{ index .State.Running}}:");
+		template.append("{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}:");
+		List<String> args = new ArrayList<>(Arrays.asList("docker", "inspect", "-f", template.toString()));
+
 		args.addAll(Arrays.asList(commandOutput.split(" ")));
 		commandOutput = runCommandAndCaptureOutput(args.toArray(new String[args.size()]));
 		log.debug("docker inspect output : " + commandOutput);
@@ -283,7 +397,7 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 				.map(desc -> desc.split(":"))
 				.map(parts -> new Container(parts[0], parts[1], parts[2].equals("true"), parts.length > 3 ? parts[3] : null))
 				.sorted(Comparator.comparing(Container::getServiceName))
-				.collect(Collectors.toList());
+				.collect(toList());
 
 	}
 
@@ -327,5 +441,51 @@ public class DockerComposeRuntime implements ContainerOrchestrationRuntime {
 
 	public void clean(String service) {
 		runCommand("docker-compose", "-p", getDockerComposeProjectName(), "rm", "-f", service);
+	}
+
+	private final static Pattern PORT_PATTERN = Pattern.compile(".*?(\\d*\\/\\w*)");
+
+	private Set<String> getExposedPorts(String dockerImage, Map<String, String> props) {
+
+		Map<String, String> mapping = new HashMap<>();
+
+		// lower priority
+		pull(PullPolicy.IF_LOCAL_IMAGE_ABSENT);
+		String output = commandRunner.runCommandAndCaptureOutput("docker", "inspect", "--format={{ .Config.ExposedPorts }}", dockerImage);
+		Matcher m = PORT_PATTERN.matcher(output);
+
+		while (m.find()) {
+			mapping.put(m.group(1), null);
+		}
+
+		// static mappings defined in .properties file
+		String customPorts = props.get("exposed.ports");
+		if (customPorts != null && !customPorts.isEmpty()) {
+			String[] ports = customPorts.split(",");
+			for (String port : ports) {
+				String[] parts = port.split(":");
+				String containerPort = parts[1].trim();
+				// Default
+				if (!containerPort.contains("/")) {
+					containerPort = containerPort + "/tcp";
+				}
+				if (!mapping.containsKey(containerPort)) {
+					log.warn("Manually exposed.port [{}] in .properties file but image doesn't expose this port.", containerPort);
+				}
+				mapping.put(containerPort, parts[0].trim());
+			}
+		}
+
+		Set<String> result = new HashSet<>();
+
+		for (Map.Entry<String, String> entry : mapping.entrySet()) {
+			if (entry.getValue() == null) {
+				result.add(entry.getKey());
+			} else {
+				result.add(entry.getValue() + ":" + entry.getKey());
+			}
+		}
+
+		return result;
 	}
 }
